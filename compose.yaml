@@ -1,6 +1,5 @@
 services:
   harbor:
-    build: .
     image: harbor-dashboard:local
     restart: unless-stopped
     ports:
