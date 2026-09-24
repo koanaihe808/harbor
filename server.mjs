@@ -3,6 +3,8 @@ import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { History } from './history.mjs';
+import { Alerts, smtpDefaults, publicSmtp } from './alerts.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const dir = process.env.DATA_DIR || path.join(root, 'data');
@@ -11,8 +13,16 @@ const file = path.join(dir, 'config.json');
 let config;
 try { config = JSON.parse(readFileSync(file, 'utf8')); }
 catch (e) { if (e.code !== 'ENOENT') throw e; config = { interval: 60, sites: [] }; }
+config.retentionDays ??= 30;
+config.smtp = { ...smtpDefaults, ...config.smtp };
+const history = new History(path.join(dir, 'history.sqlite'));
+const alerts = new Alerts(history, dir, () => config);
+history.prune(config.retentionDays);
 const results = new Map();
+const timelineCache = new Map();
+for (const s of config.sites) { const last = history.latest(s.id); if (last) results.set(s.id, last); }
 let running = null, timer;
+let monitoringError = '';
 const password = process.env.DASHBOARD_PASSWORD;
 const host = process.env.HOST || '127.0.0.1';
 if (!password && host !== '127.0.0.1' && host !== 'localhost') throw new Error('Set DASHBOARD_PASSWORD before listening beyond localhost.');
@@ -47,14 +57,21 @@ async function check(s) {
     result = { state: 'down', latency: null, code: null, detail: e.name === 'TimeoutError' ? 'Timed out after 8 seconds' : 'Connection, DNS, or TLS error' };
   }
   // Do not publish an old result after a site was edited or removed.
-  if (config.sites.includes(s)) results.set(s.id, { ...result, checkedAt: new Date().toISOString() });
+  if (config.sites.includes(s)) {
+    const complete = { ...result, checkedAt: new Date().toISOString() };
+    history.record(s.id, complete);
+    results.set(s.id, complete);
+    alerts.observe(s, complete);
+  }
 }
 function schedule() { clearTimeout(timer); timer = setTimeout(() => runChecks(), config.interval * 1000); }
 function runChecks() {
   if (running) return running;
   clearTimeout(timer);
   const queue = [...config.sites];
-  running = Promise.all(Array.from({ length: Math.min(5, queue.length) }, async () => { while (queue.length) await check(queue.shift()); }))
+  monitoringError = '';
+  running = Promise.all(Array.from({ length: Math.min(5, queue.length) }, async () => { while (queue.length) { try { await check(queue.shift()); } catch { monitoringError = 'A monitoring result could not be saved. Check available disk space and data-folder permissions.'; } } }))
+    .then(() => { try { history.prune(config.retentionDays); } catch { monitoringError = 'History cleanup failed. Check disk space and data-folder permissions.'; } })
     .finally(() => { running = null; schedule(); });
   return running;
 }
@@ -86,12 +103,46 @@ const server = http.createServer(async (req, res) => {
       if (req.headers['sec-fetch-site'] === 'cross-site') return send(403, { error: 'Cross-site requests are blocked.' });
       if (req.headers.origin && new URL(req.headers.origin).host !== req.headers.host) return send(403, { error: 'Origin mismatch.' });
     }
-    if (pathname === '/api/state' && req.method === 'GET') return send(200, { interval: config.interval, checking: !!running, sites: config.sites.map(s => ({ ...s, status: results.get(s.id) || { state: 'unknown', checkedAt: null, latency: null, detail: 'Waiting for first check' } })) });
+    if (pathname === '/api/state' && req.method === 'GET') {
+      const now = Date.now();
+      return send(200, { interval: config.interval, retentionDays: config.retentionDays, checking: !!running, monitoringError, alerts: alerts.status(), sites: config.sites.map(s => {
+        const status = results.get(s.id) || { state: 'unknown', checkedAt: null, latency: null, detail: 'Waiting for first check' };
+        const key = `${status.checkedAt}:${Math.floor(now / 60000)}`;
+        if (timelineCache.get(s.id)?.key !== key) timelineCache.set(s.id, { key, value: history.timeline(s.id, now) });
+        return { ...s, timeline: timelineCache.get(s.id).value, status };
+      }) });
+    }
+    if (pathname.startsWith('/api/history/') && req.method === 'GET') {
+      const id = pathname.split('/').pop();
+      if (!config.sites.some(s => s.id === id)) return send(404, { error: 'Site not found.' });
+      const days = Number(new URL(req.url, 'http://localhost').searchParams.get('days') || config.retentionDays);
+      if (!Number.isInteger(days) || days < 1 || days > config.retentionDays) throw new Error(`Choose 1–${config.retentionDays} days.`);
+      return send(200, history.summary(id, days));
+    }
+    if (pathname === '/api/smtp' && req.method === 'GET') return send(200, publicSmtp(config.smtp));
+    if (pathname === '/api/smtp' && req.method === 'PUT') {
+      const smtp = alerts.validate(await body(req), config.smtp);
+      save({ ...config, smtp });
+      if (!smtp.enabled) alerts.cancelPending();
+      return send(200, publicSmtp(smtp));
+    }
+    if (pathname === '/api/smtp/test' && req.method === 'POST') {
+      await body(req);
+      alerts.requireComplete(config.smtp);
+      try {
+        const result = await alerts.send(config.smtp, '[Harbor] Test notification', 'Your Harbor SMTP relay is configured. This is a test notification.');
+        if (result.rejected?.length) return send(400, { error: 'The relay rejected one or more test recipients. Check recipient addresses.' });
+        return send(200, { ok: true, message: 'Test message accepted by the relay. Check the recipient inbox.' });
+      } catch (e) { return send(400, { error: alerts.safeError(e) }); }
+    }
     if (pathname === '/api/check' && req.method === 'POST') { await body(req); void runChecks(); return send(202, { ok: true }); }
     if (pathname === '/api/settings' && req.method === 'PUT') {
-      const { interval } = await body(req);
+      const input = await body(req);
+      const interval = input.interval ?? config.interval;
+      const retentionDays = input.retentionDays ?? config.retentionDays;
       if (!Number.isInteger(interval) || interval < 15 || interval > 3600) throw new Error('Polling interval must be 15–3600 seconds.');
-      save({ ...config, interval }); schedule(); return send(200, { ok: true });
+      if (!Number.isInteger(retentionDays) || retentionDays < 1 || retentionDays > 185) throw new Error('History retention must be 1–185 days.');
+      save({ ...config, interval, retentionDays }); history.prune(retentionDays); schedule(); return send(200, { ok: true });
     }
     if (pathname === '/api/sites' && req.method === 'POST') {
       if (config.sites.length >= 100) throw new Error('Maximum of 100 sites.');
@@ -102,8 +153,12 @@ const server = http.createServer(async (req, res) => {
       const id = pathname.split('/').pop();
       if (!config.sites.some(s => s.id === id)) return send(404, { error: 'Site not found.' });
       const input = await body(req);
+      const previous = config.sites.find(s => s.id === id);
       const sites = req.method === 'DELETE' ? config.sites.filter(s => s.id !== id) : config.sites.map(s => s.id === id ? { ...site(input), id } : s);
-      save({ ...config, sites }); results.delete(id); void runChecks(); return send(200, { ok: true });
+      save({ ...config, sites }); results.delete(id);
+      if (req.method === 'DELETE') { history.remove(id); timelineCache.delete(id); }
+      else { const updated = sites.find(s => s.id === id); if (['url', 'healthUrl', 'expected'].some(k => previous[k] !== updated[k])) history.db.prepare('DELETE FROM incidents WHERE site=?').run(id); }
+      void runChecks(); return send(200, { ok: true });
     }
     if (assets[pathname] && req.method === 'GET') {
       const [name, type] = assets[pathname]; res.writeHead(200, { 'Content-Type': type + '; charset=utf-8' }); return res.end(readFileSync(path.join(root, 'public', name)));
@@ -112,4 +167,5 @@ const server = http.createServer(async (req, res) => {
   } catch (e) { send(400, { error: e instanceof TypeError ? 'Enter valid HTTP or HTTPS URLs.' : e.message }); }
 });
 server.requestTimeout = 15000;
+setInterval(() => { void alerts.flush().catch(() => { monitoringError = 'Alert processing failed. Check the data folder.'; }); }, 5000).unref();
 server.listen(Number(process.env.PORT || 8080), host, () => { console.log(`Harbor running at http://${host}:${process.env.PORT || 8080}`); void runChecks(); });

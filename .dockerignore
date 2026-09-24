@@ -3,3 +3,4 @@ data
 .git
 tests
 *.zip
+node_modules
